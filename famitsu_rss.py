@@ -5,9 +5,11 @@ Famitsu publishes no RSS of its own. The site is a Next.js app, so its
 article lists and article bodies can be read as JSON under
 /_next/data/<buildId>/, the same approach as RSSHub's famitsu route.
 
-Each run reads the previously published cache.json from the site, so only
-articles it has not seen before are downloaded in full. If a category fails,
-its previously published feed is kept.
+Each run reads the previously published site, so only articles it has not
+seen before are downloaded in full, and a category that fails this time keeps
+its old feed. GitHub often starts scheduled runs hours late, so when a
+category's first page does not reach back to the previous feed's newest
+article, later pages are read too.
 
 Usage: python3 famitsu_rss.py --out site --base-url https://USER.github.io/REPO
 """
@@ -17,9 +19,11 @@ import datetime as dt
 import email.utils
 import html
 import json
+import os
 import re
 import sys
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,7 +56,8 @@ CATEGORIES = {
     "indie-game": "インディーゲーム",
 }
 
-MAX_DETAIL_FETCHES = 120  # full-article downloads per run
+MAX_PAGES = 3  # list pages read per category when catching up
+MAX_DETAIL_FETCHES = 150  # full-article downloads per run
 REQUEST_GAP = 1.0  # seconds between requests to famitsu.com
 
 
@@ -90,7 +95,8 @@ def famitsu_get(path, params=None):
 def get_previous(url):
     """Fetch a file from the currently published site, or None if absent."""
     try:
-        return http_get(url, retries=2)
+        # The query string skips the Pages CDN's cached copy.
+        return http_get(url, {"t": int(time.time())}, retries=2)
     except (urllib.error.URLError, TimeoutError):
         return None
 
@@ -98,6 +104,13 @@ def get_previous(url):
 def warn(msg):
     # Shows up as a yellow annotation on the GitHub Actions run.
     print(f"::warning::{msg}", file=sys.stderr)
+
+
+def describe(e):
+    """Exception text with the script line it came from, for run annotations."""
+    frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == __file__]
+    where = f" (line {frames[-1].lineno})" if frames else ""
+    return f"{type(e).__name__}: {e}{where}"
 
 
 def get_build_id():
@@ -116,33 +129,69 @@ def parse_date(s):
     return d if d.tzinfo else d.replace(tzinfo=JST)
 
 
-def category_items(build_id, code):
-    data = json.loads(famitsu_get(
-        f"/_next/data/{build_id}/category/{code}/page/1.json",
-        {"categoryCode": code, "pageNumber": 1},
-    ))["pageProps"]
-    name = (data.get("targetCategory") or {}).get("nameJa") or CATEGORIES[code]
-    items = []
-    for a in data["categoryArticleDataForPc"]:
-        if a.get("advertiserName") or not a.get("publishedAt"):
-            continue
-        pub = a["publishedAt"][:7].replace("-", "")
-        cats = [a["mainCategory"]["nameJa"]] + [c["nameJa"] for c in a.get("subCategories") or []]
-        thumb = a.get("thumbnailUrl")
-        items.append({
-            "id": a["id"],
-            "pub": pub,
-            "title": a["title"],
-            "link": f"{BASE}/article/{pub}/{a['id']}",
-            "date": parse_date(a["publishedAt"]),
-            "categories": list(dict.fromkeys(cats)),
-            # Used until the full article has been downloaded.
-            "description": (f'<img src="{thumb}"><br>' if thumb else "") + html.escape(a.get("description") or ""),
-            "author": "",
-        })
+def feed_newest(feed_xml):
+    """The newest article time in a published feed (its lastBuildDate)."""
+    m = re.search(r"<lastBuildDate>(.*?)</lastBuildDate>", feed_xml or "")
+    try:
+        return email.utils.parsedate_to_datetime(m.group(1)) if m else None
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_article(a):
+    """One entry of a category list, or None for ads and undated entries."""
+    if a.get("advertiserName") or not a.get("publishedAt"):
+        return None
+    pub = a["publishedAt"][:7].replace("-", "")
+    cats = [c.get("nameJa") for c in [a.get("mainCategory"), *(a.get("subCategories") or [])] if c]
+    thumb = a.get("thumbnailUrl")
+    return {
+        "id": a["id"],
+        "pub": pub,
+        "title": a.get("title") or "",
+        "link": f"{BASE}/article/{pub}/{a['id']}",
+        "date": parse_date(a["publishedAt"]),
+        "categories": list(dict.fromkeys(c for c in cats if c)),
+        # Used until the full article has been downloaded.
+        "description": (f'<img src="{thumb}"><br>' if thumb else "") + html.escape(a.get("description") or ""),
+        "author": "",
+    }
+
+
+def category_items(build_id, code, since=None):
+    """Articles on the category's first page, plus later pages while they are
+    all newer than `since` (the previous feed's newest article)."""
+    name, items, seen = CATEGORIES[code], [], set()
+    for page in range(1, MAX_PAGES + 1):
+        try:
+            data = json.loads(famitsu_get(
+                f"/_next/data/{build_id}/category/{code}/page/{page}.json",
+                {"categoryCode": code, "pageNumber": page},
+            ))["pageProps"]
+        except Exception as e:
+            if page == 1:
+                raise
+            warn(f"{code} page {page}: {describe(e)}")
+            break
+        if page == 1:
+            name = (data.get("targetCategory") or {}).get("nameJa") or name
+        dates = []
+        for a in data.get("categoryArticleDataForPc") or []:
+            try:
+                item = parse_article(a)
+            except Exception as e:
+                warn(f"{code}: skipped article {a.get('id') if isinstance(a, dict) else a!r}: {describe(e)}")
+                continue
+            if item and item["link"] not in seen:
+                seen.add(item["link"])
+                items.append(item)
+                if item["date"]:
+                    dates.append(item["date"])
+        if since is None or not dates or min(dates) <= since:
+            break
     if not items:
         raise RuntimeError("category page listed no articles")
-    return name, items
+    return name, items, page
 
 
 TAGS = {
@@ -167,9 +216,11 @@ def render_block(c):
     """Turn one block of Famitsu's article JSON into HTML."""
     if isinstance(c, str):
         return c
+    if not isinstance(c, dict):
+        return ""
     content = c.get("content")
     if isinstance(content, list):
-        return "".join(render_block(x) for x in content if isinstance(x, str) or x.get("type"))
+        return "".join(render_block(x) for x in content if isinstance(x, str) or (x or {}).get("type"))
     fields = {
         "text": content or "",
         "url": (c.get("url") or "").replace('"', "&quot;"),
@@ -189,8 +240,8 @@ def article_detail(build_id, pub, article_id):
         {"publicationDate": pub, "articleId": article_id},
     ))["pageProps"]["articleDetailData"]
     banner = d.get("ogpImageUrl") or d.get("thumbnailUrl")
-    body = "".join(render_block(c) for page in d.get("content") or [] for c in page.get("contents") or [])
-    authors = ", ".join(a["name_ja"] for a in d.get("authors") or [] if a.get("name_ja"))
+    body = "".join(render_block(c) for page in d.get("content") or [] for c in (page or {}).get("contents") or [])
+    authors = ", ".join(a["name_ja"] for a in d.get("authors") or [] if a and a.get("name_ja"))
     return {
         "description": (f'<img src="{banner}"><br>' if banner else "") + body,
         "author": authors or (d.get("user") or {}).get("name_ja", ""),
@@ -260,7 +311,7 @@ input {{ flex: 1; min-width: 0; font: 14px ui-monospace, monospace; padding: .35
 </head>
 <body>
 <h1>ファミ通.com RSS</h1>
-<p>Unofficial feeds built from <a href="{BASE}/">famitsu.com</a>, updated about once an hour.
+<p>Unofficial feeds built from <a href="{BASE}/">famitsu.com</a>, updated several times a day.
 Copy a URL into Feedly or Inoreader.</p>
 <ul>
 {rows}
@@ -279,23 +330,25 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     base_url = args.base_url.rstrip("/")
 
+    previous = {name: get_previous(f"{base_url}/{name}")
+                for name in ["cache.json", "index.html"] + [f"{code}.xml" for code in CATEGORIES]}
     try:
-        cache = json.loads(get_previous(f"{base_url}/cache.json") or "{}")
+        cache = json.loads(previous["cache.json"] or "{}")
     except json.JSONDecodeError:
         cache = {}
     build_id = get_build_id()
 
-    new_cache, feeds, failed = {}, [], []
+    files, new_cache, feeds, failed, counts = {}, {}, [], [], []
     budget = MAX_DETAIL_FETCHES
     for code in CATEGORIES:
+        old_feed = previous[f"{code}.xml"]
         try:
-            name, items = category_items(build_id, code)
+            name, items, pages = category_items(build_id, code, since=feed_newest(old_feed))
         except Exception as e:
-            warn(f"{code}: {e}")
+            warn(f"{code}: {describe(e)}")
             failed.append(code)
-            previous = get_previous(f"{base_url}/{code}.xml")
-            if previous:
-                (out / f"{code}.xml").write_text(previous, encoding="utf-8")
+            if old_feed:
+                files[f"{code}.xml"] = old_feed
                 feeds.append((code, CATEGORIES[code]))
             continue
         for item in items:
@@ -305,18 +358,27 @@ def main():
                 try:
                     detail = article_detail(build_id, item["pub"], item["id"])
                 except Exception as e:
-                    warn(f"{item['link']}: {e}")
+                    warn(f"{item['link']}: {describe(e)}")
             if detail:
                 new_cache[item["link"]] = detail
                 item.update(detail)
-        (out / f"{code}.xml").write_text(build_feed(code, name, items, base_url), encoding="utf-8")
+        files[f"{code}.xml"] = build_feed(code, name, items, base_url)
         feeds.append((code, name))
-        print(f"{code}: {len(items)} articles")
+        counts.append(f"{code} {len(items)}" + (f" ({pages} pages)" if pages > 1 else ""))
 
     # Only articles in this run's feeds are kept, so the cache cannot grow without bound.
-    (out / "cache.json").write_text(json.dumps(new_cache, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    (out / "index.html").write_text(build_index(feeds, base_url), encoding="utf-8")
-    print(f"downloaded {MAX_DETAIL_FETCHES - budget} new articles")
+    files["cache.json"] = json.dumps(new_cache, ensure_ascii=False, sort_keys=True)
+    files["index.html"] = build_index(feeds, base_url)
+    for name, text in files.items():
+        (out / name).write_text(text, encoding="utf-8")
+    changed = any(previous.get(name) != text for name, text in files.items())
+
+    downloaded = MAX_DETAIL_FETCHES - budget
+    print(f"::notice::{'Updated' if changed else 'No change'}; {downloaded} articles downloaded; "
+          + ", ".join(counts))
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"changed={'true' if changed else 'false'}\n")
     if len(failed) == len(CATEGORIES):
         sys.exit("every category failed; leaving the published site as it is")
 

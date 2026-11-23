@@ -2,7 +2,8 @@ name: Update Famitsu feeds
 
 on:
   schedule:
-    - cron: "23 * * * *" # hourly; GitHub often starts scheduled runs a few minutes late
+    # GitHub skips many scheduled runs under load, so ask often to get a run every hour or two.
+    - cron: "*/15 * * * *"
   workflow_dispatch:
   push:
     branches: [main]
@@ -22,7 +23,7 @@ jobs:
     timeout-minutes: 20
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment_retry.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
 
@@ -30,13 +31,27 @@ jobs:
         uses: actions/configure-pages@v6
 
       - name: Build feeds
+        id: build
         run: python3 famitsu_rss.py --out site --base-url "${{ steps.pages.outputs.base_url }}"
 
-      - uses: actions/upload-pages-artifact@v5
+      - if: steps.build.outputs.changed == 'true'
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - id: deployment
+        if: steps.build.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      # deploy-pages sometimes cannot see the artifact uploaded a moment earlier
+      # ("No artifacts named github-pages were found"); a retry a minute later clears it.
+      - name: Wait before retrying the deploy
+        if: steps.deployment.outcome == 'failure'
+        run: sleep 60
+
+      - id: deployment_retry
+        if: steps.deployment.outcome == 'failure'
         uses: actions/deploy-pages@v5
 
       - name: Keep the schedule alive

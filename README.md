@@ -1,7 +1,7 @@
 # famitsu-rss
 
 Unofficial RSS feeds for [ファミ通.com](https://www.famitsu.com/), which no longer publishes its own.
-A GitHub Actions job runs `famitsu_rss.py` about once an hour and publishes the feeds on GitHub Pages.
+A GitHub Actions job runs `famitsu_rss.py` several times a day and publishes the feeds on GitHub Pages.
 The feeds include each article's full text.
 
 ## Feeds
@@ -28,12 +28,15 @@ Each feed is at `https://<user>.github.io/<repo>/<category>.xml`:
 1. Settings → Pages → Build and deployment → Source: **GitHub Actions**.
 2. Actions → *Update Famitsu feeds* → **Run workflow** (or push to `main`).
 
-After that, the job runs hourly on its own. It adds an empty commit once a month,
-because GitHub turns off scheduled workflows in repositories with no activity for 60 days.
+After that, the job runs on its own. It asks for a run every 15 minutes because GitHub skips
+many scheduled runs, and it does not redeploy when nothing is new. It adds an empty commit
+once a month, because GitHub turns off scheduled workflows in repositories with no activity
+for 60 days.
 
 ## If the feeds stop updating
 
-Famitsu can change its site at any time. GitHub emails you when a scheduled run fails;
-the run log says which request broke. The data comes from the same endpoints as
+Famitsu can change its site at any time. GitHub emails you when a scheduled run fails.
+Each run's page shows a one-line summary (articles per feed, articles downloaded) and a warning
+for any category or article that could not be read. The data comes from the same endpoints as
 [RSSHub's famitsu route](https://github.com/DIYgod/RSSHub/tree/master/lib/routes/famitsu),
 so a fix there usually shows what changed.
